@@ -1,161 +1,98 @@
-# Event-Driven Architecture - Exercise 2
+# Event-Driven Order Processing System
 
-## 1. Student Information
-- **Full Name:** Guy Israeli
-- **ID Number:** 323870238
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.109-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-7.6-231F20?logo=apachekafka&logoColor=white)](https://kafka.apache.org)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
 
----
-
-## 2. Topic Names and Purpose
-
-| Topic Name | Used By | Purpose |
-|------------|---------|---------|
-| `orders.events` | Producer (Cart Service) | Publishes order events when orders are created or updated |
-| `orders.events` | Consumer (Order Service) | Receives and processes order events to store order details and calculate shipping costs |
-
-**Event Types Published to `orders.events`:**
-- `ORDER_CREATED` - Published when a new order is created via `/create-order`. Contains the full order object.
-- `ORDER_STATUS_UPDATED` - Published when order status changes via `/update-order`. Contains the order ID and new status.
+A production-style **event-driven microservices system** built with **FastAPI** and **Apache Kafka**, implementing order lifecycle management with strict event ordering, idempotent processing, and resilient error handling.
 
 ---
 
-## 3. Message Key
+## Architecture
 
-**Key Used:** `order_id` (e.g., `ORD-123`)
+```
+┌──────────────┐       ┌─────────────────┐       ┌──────────────────┐
+│    Client     │──────▶│  Cart Service    │──────▶│   Apache Kafka   │
+│  (HTTP API)   │       │  (Producer:8000) │       │  orders.events   │
+└──────────────┘       └─────────────────┘       └────────┬─────────┘
+                                                          │
+                                                          ▼
+                                                 ┌──────────────────┐
+                                                 │  Order Service    │
+                                                 │  (Consumer:8001) │
+                                                 └──────────────────┘
+```
 
-**Why this key was chosen:**
-1. **Ordering Guarantee:** Kafka guarantees message ordering only within a single partition. By using `order_id` as the key, all events for the same order are hashed to the same partition, ensuring they are processed in the exact sequence they were published.
-2. **Consistency:** When an order is created and then updated multiple times, the consumer processes these events in the correct chronological order, preventing race conditions.
-3. **Scalability:** Different orders can be processed in parallel across different partitions, while events for the same order remain strictly sequential.
+**Flow:**
+1. Client sends HTTP requests to the **Cart Service**
+2. Cart Service validates the request and publishes order events to Kafka
+3. **Order Service** consumes events sequentially per order (guaranteed by partition key)
+4. Order state and shipping costs are calculated and exposed via REST API
 
 ---
 
-## 4. Error Handling Approaches
+## Tech Stack
 
-### 4.1 Producer (Cart Service) Error Handling
-
-| Error Type | Handling Approach | HTTP Response |
-|------------|-------------------|---------------|
-| Order already exists | Catch `OrderAlreadyExists` exception | 409 Conflict |
-| Order not found (on update) | Catch `OrderNotFound` exception | 404 Not Found |
-| Kafka broker unavailable | Retry with exponential backoff (3 retries), raise `KafkaBrokersUnavailable` | 503 Service Unavailable |
-| Kafka flush timeout | Retry with backoff, raise `KafkaTimeout` | 503 Service Unavailable |
-| Producer queue full (BufferError) | Retry with backoff, raise `ProducerQueueFull` | 503 Service Unavailable |
-| General/unexpected errors | Catch all exceptions | 500 Internal Server Error |
-
-**Why these approaches:**
-- **Retry with backoff** for Kafka errors because they are often transient (broker restart, network blip).
-- **Idempotent producer** (`enable.idempotence: True`) prevents duplicate messages even when retrying.
-- **`acks: all`** ensures durability - message is only acknowledged after all in-sync replicas confirm.
-- **Specific HTTP status codes** allow clients to differentiate between client errors (4xx) and server/infrastructure errors (5xx).
-
-### 4.2 Consumer (Order Service) Error Handling
-
-| Error Type | Handling Approach | Why |
-|------------|-------------------|-----|
-| Topic not available (`UNKNOWN_TOPIC_OR_PART`) | Continue polling silently | Topic auto-creates when producer sends first message |
-| Kafka connection error | Reconnect with backoff (5 retries, 2 sec interval) | Transient failures recover automatically |
-| Message deserialization error | Log error, skip message, continue | Prevents poison messages from blocking the queue |
-| Out-of-order events (status update before create) | Store pending status in memory, apply when order arrives | Handles eventual consistency without losing data |
-| Duplicate `ORDER_CREATED` events | Ignore if order already exists in DB | Ensures idempotent processing |
-
-**Why these approaches:**
-- **Reconnection logic** ensures the consumer auto-recovers from temporary Kafka issues.
-- **Graceful handling of missing topics** allows services to start in any order.
-- **Pending status buffer** handles race conditions where status updates arrive before the order creation event.
-
-### 4.3 API Error Responses Summary
-
-| Endpoint | Method | Success | Error Cases |
-|----------|--------|---------|-------------|
-| `/create-order` | POST | 200 | 409 (duplicate), 503 (Kafka), 500 (general) |
-| `/update-order` | PUT | 200 | 404 (not found), 503 (Kafka), 500 (general) |
-| `/order-details` | GET | 200 | 400 (invalid orderId format), 404 (not found) |
-| `/getAllOrderIdsFromTopic` | GET | 200 | Returns empty list if no orders |
+| Layer | Technology |
+|-------|-----------|
+| API Framework | FastAPI + Uvicorn |
+| Message Broker | Apache Kafka (Confluent) |
+| Serialization | JSON with Pydantic models |
+| Containerization | Docker + Docker Compose |
+| Language | Python 3.11 |
 
 ---
 
-## 5. How to Run (Windows Instructions)
+## Key Design Decisions
 
-### Prerequisites
-- Docker Desktop for Windows installed and running
-- Open PowerShell or Command Prompt
+### Event-Driven Communication
+Services are fully decoupled — the producer has no knowledge of downstream consumers. This enables independent scaling, deployment, and failure isolation.
 
-### Option A: Run Producer (Cart Service)
-```powershell
-cd services\cart_service
-docker-compose -f docker-compose-producer.yml up --build
-```
-API available at: `http://localhost:8000`
+### Kafka Partition Key Strategy
+All events use `order_id` as the message key. This ensures:
+- **Strict ordering** — all events for the same order land in the same partition
+- **Horizontal scalability** — different orders are distributed across partitions
+- **Consistency** — status updates are always processed after the corresponding order creation
 
-**Test the API:**
-```powershell
-# Create an order
-curl -X POST http://localhost:8000/create-order -H "Content-Type: application/json" -d "{\"order_id\": \"123\", \"number_of_items\": 3}"
-
-# Update order status
-curl -X PUT http://localhost:8000/update-order -H "Content-Type: application/json" -d "{\"order_id\": \"ORD-123\", \"status\": \"confirmed\"}"
-```
-
-### Option B: Run Consumer (Order Service)
-```powershell
-cd services\order_service
-docker-compose -f docker-compose-consumer.yml up --build
-```
-API available at: `http://localhost:8001`
-
-**Test the API:**
-```powershell
-# Get order details
-curl http://localhost:8001/order-details?orderId=ORD-123
-
-# Get all order IDs from topic
-curl http://localhost:8001/getAllOrderIdsFromTopic?topicName=orders.events
-```
-
-### Running Both Services Together (Full Integration)
-To test the full flow where producer sends orders and consumer receives them, use the main docker-compose from the project root:
-
-```powershell
-# From project root directory
-docker-compose up --build
-```
-
-This runs both services with a **shared Kafka cluster**, allowing end-to-end communication:
-- Cart Service API: `http://localhost:8000`
-- Order Service API: `http://localhost:8001`
-
-**Note:** The individual docker-compose files in each service folder are designed for **isolated testing** of each service. For full integration where orders flow from producer to consumer, use the root docker-compose.yml.
-
-### Stopping Services
-```powershell
-# Stop Producer
-cd services\cart_service
-docker-compose -f docker-compose-producer.yml down
-
-# Stop Consumer
-cd services\order_service
-docker-compose -f docker-compose-consumer.yml down
-```
+### Event Types
+| Event | Trigger | Payload |
+|-------|---------|---------|
+| `ORDER_CREATED` | `POST /create-order` | Full order object |
+| `ORDER_STATUS_UPDATED` | `PUT /update-order` | Order ID + new status |
 
 ---
 
-## 6. API Endpoints
+## Error Handling
 
-### Cart Service (Producer) - Port 8000
+### Producer (Cart Service)
+- **Idempotent producer** (`enable.idempotence = true`) prevents duplicate messages on retry
+- **`acks=all`** ensures messages are replicated before acknowledgment
+- **Exponential backoff** for transient Kafka failures (broker unavailable, buffer full, flush timeout)
+- Proper HTTP status codes: `409` for duplicates, `404` for missing orders, `503` for Kafka issues
 
-#### POST /create-order
-Creates a new order and publishes `ORDER_CREATED` event to Kafka.
+### Consumer (Order Service)
+- **Auto-reconnection** with configurable backoff on Kafka connection loss
+- **Poison message handling** — malformed messages are logged and skipped
+- **Out-of-order event buffering** — status updates arriving before `ORDER_CREATED` are queued and applied when the order arrives
+- **Idempotent processing** — duplicate `ORDER_CREATED` events are safely ignored
+- **Graceful topic handling** — consumer starts cleanly even if the topic doesn't exist yet
 
-**Request:**
-```json
-{
-  "order_id": "123",
-  "number_of_items": 3
-}
+---
+
+## API Reference
+
+### Cart Service (Producer) — Port 8000
+
+#### `POST /create-order`
+Creates a new order and publishes an `ORDER_CREATED` event.
+
+```bash
+curl -X POST http://localhost:8000/create-order \
+  -H "Content-Type: application/json" \
+  -d '{"order_id": "123", "number_of_items": 3}'
 ```
 
-**Response (200):**
 ```json
 {
   "message": "order created and published successfully",
@@ -163,18 +100,15 @@ Creates a new order and publishes `ORDER_CREATED` event to Kafka.
 }
 ```
 
-#### PUT /update-order
-Updates order status and publishes `ORDER_STATUS_UPDATED` event to Kafka.
+#### `PUT /update-order`
+Updates order status and publishes an `ORDER_STATUS_UPDATED` event.
 
-**Request:**
-```json
-{
-  "order_id": "ORD-123",
-  "status": "confirmed"
-}
+```bash
+curl -X PUT http://localhost:8000/update-order \
+  -H "Content-Type: application/json" \
+  -d '{"order_id": "ORD-123", "status": "confirmed"}'
 ```
 
-**Response (200):**
 ```json
 {
   "message": "order status updated and published successfully",
@@ -182,19 +116,24 @@ Updates order status and publishes `ORDER_STATUS_UPDATED` event to Kafka.
 }
 ```
 
-### Order Service (Consumer) - Port 8001
+---
 
-#### GET /order-details?orderId=\<id\>
+### Order Service (Consumer) — Port 8001
+
+#### `GET /order-details?orderId=<id>`
 Returns order details with calculated shipping cost.
 
-**Response (200):**
+```bash
+curl http://localhost:8001/order-details?orderId=ORD-123
+```
+
 ```json
 {
   "order": {
     "orderId": "ORD-123",
     "customerId": "CUST-...",
     "orderDate": "2024-01-18T12:00:00Z",
-    "items": [...],
+    "items": ["..."],
     "totalAmount": 150.00,
     "currency": "USD",
     "status": "confirmed"
@@ -203,10 +142,13 @@ Returns order details with calculated shipping cost.
 }
 ```
 
-#### GET /getAllOrderIdsFromTopic?topicName=\<topic\>
-Returns all order IDs received from the specified Kafka topic.
+#### `GET /getAllOrderIdsFromTopic?topicName=<topic>`
+Returns all order IDs received from a Kafka topic.
 
-**Response (200):**
+```bash
+curl http://localhost:8001/getAllOrderIdsFromTopic?topicName=orders.events
+```
+
 ```json
 {
   "topicName": "orders.events",
@@ -216,76 +158,80 @@ Returns all order IDs received from the specified Kafka topic.
 
 ---
 
-## 7. Project Structure
+## Getting Started
 
+### Prerequisites
+- [Docker](https://www.docker.com/products/docker-desktop/) installed and running
+
+### Run the Producer (Cart Service)
+```bash
+cd services/cart_service
+docker-compose -f docker-compose-producer.yml up --build
 ```
-ex2_event_driven/
-├── docker-compose.yml              # Main compose (all services)
-├── docker-compose.dev.yml          # Development with Kafka UI
-├── Dockerfile
-├── requirements.txt
-├── libs/
-│   └── kafka_common/               # Shared Kafka utilities
-│       ├── config.py               # Kafka configuration
-│       ├── kafka_factory.py        # Producer/Consumer factory
-│       ├── events.py               # Event models
-│       ├── models.py               # Order models
-│       └── serdes_json.py          # JSON serialization
-├── services/
-│   ├── cart_service/               # Producer service
-│   │   ├── docker-compose-producer.yml  # Standalone compose file
-│   │   ├── app/api/routes.py       # API endpoints
-│   │   ├── publisher.py            # Kafka publisher with error handling
-│   │   └── order_generator.py      # Order creation logic
-│   └── order_service/              # Consumer service
-│       ├── docker-compose-consumer.yml  # Standalone compose file
-│       ├── app/api/routes.py       # API endpoints
-│       ├── consumer_runner.py      # Kafka consumer with reconnection
-│       ├── order_event_handler.py  # Event processing logic
-│       └── consumer_db.py          # In-memory order storage
-└── tests/
+API available at `http://localhost:8000`
+
+### Run the Consumer (Order Service)
+```bash
+cd services/order_service
+docker-compose -f docker-compose-consumer.yml up --build
+```
+API available at `http://localhost:8001`
+
+### Stop & Clean Up
+```bash
+docker-compose -f docker-compose-producer.yml down -v
+docker-compose -f docker-compose-consumer.yml down -v
 ```
 
 ---
 
-## 8. Submission Files
+## Project Structure
 
-### Docker Compose Files (2 required)
-1. **services/cart_service/docker-compose-producer.yml** - Producer (Cart Service) Docker Compose
-2. **services/order_service/docker-compose-consumer.yml** - Consumer (Order Service) Docker Compose
-
-### Documentation
-3. **README.md** - This file (answers all required questions)
-
-### How to Test (for checker on Windows)
-
-**Step 1:** Extract the submitted zip file
-
-**Step 2:** Run Producer (Cart Service)
-```powershell
-cd services\cart_service
-docker-compose -f docker-compose-producer.yml up --build
 ```
-Wait for "Application startup complete" message. API at `http://localhost:8000`
-
-**Step 3:** Run Consumer (Order Service) - in a new terminal
-```powershell
-cd services\order_service
-docker-compose -f docker-compose-consumer.yml up --build
+.
+├── Dockerfile
+├── requirements.txt
+├── docker-compose.yml                          # Full system compose
+├── libs/
+│   └── kafka_common/                           # Shared Kafka library
+│       ├── config.py                           # Broker configuration
+│       ├── kafka_factory.py                    # Producer/Consumer factory
+│       ├── events.py                           # Event models
+│       ├── models.py                           # Order domain models
+│       └── serdes_json.py                      # JSON serialization
+├── services/
+│   ├── cart_service/                           # Producer microservice
+│   │   ├── docker-compose-producer.yml
+│   │   ├── main.py
+│   │   ├── app/api/routes.py                   # REST endpoints
+│   │   ├── publisher.py                        # Kafka publisher
+│   │   ├── order_generator.py                  # Order creation logic
+│   │   └── store_memory.py                     # In-memory order store
+│   └── order_service/                          # Consumer microservice
+│       ├── docker-compose-consumer.yml
+│       ├── app/
+│       │   ├── main.py
+│       │   └── api/routes.py                   # REST endpoints
+│       ├── consumer_runner.py                  # Kafka consumer loop
+│       ├── order_event_handler.py              # Event processing logic
+│       ├── consumer_db.py                      # In-memory order storage
+│       └── tests/                              # Unit tests
+└── tests/
+    └── test_e2e.py                             # End-to-end tests
 ```
-Wait for "Application startup complete" message. API at `http://localhost:8001`
 
-**Step 4:** Test the flow
-```powershell
-# Create an order (Producer)
-curl -X POST http://localhost:8000/create-order -H "Content-Type: application/json" -d "{\"order_id\": \"123\", \"number_of_items\": 3}"
+---
 
-# Get order details (Consumer)
-curl "http://localhost:8001/order-details?orderId=ORD-123"
+## Testing
 
-# Update order status (Producer)
-curl -X PUT http://localhost:8000/update-order -H "Content-Type: application/json" -d "{\"order_id\": \"ORD-123\", \"status\": \"confirmed\"}"
-
-# Get all order IDs from topic (Consumer)
-curl "http://localhost:8001/getAllOrderIdsFromTopic?topicName=orders.events"
+```bash
+# Run unit tests
+pip install pytest pytest-asyncio httpx
+PYTHONPATH=. pytest services/order_service/tests/ -v
 ```
+
+---
+
+## License
+
+MIT
